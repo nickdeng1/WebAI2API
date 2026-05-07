@@ -36,18 +36,21 @@
 ### 📋 支持列表
 
 | 网站名称 | 文本生成 | 图片生成 | 视频生成 |
-| :--- | :---: | :---: | :---: | 
+| :--- | :---: | :---: | :---: |
 | [**LMArena**](https://lmarena.ai/) | ✅ | ✅ | 🚫 |
 | [**Gemini Enterprise Business**](https://business.gemini.google/) | ✅ | ✅ | ✅ |
 | [**Nano Banana Free**](https://nanobananafree.ai/) | 🚫 | ✅ | 🚫 |
 | [**zAI**](https://zai.is/) | ✅ | ✅ | 🚫 |
-| [**Google Gemini**](https://gemini.google.com/) | ✅ | ✅💧 | ✅💧 | 
-| [**ZenMux**](https://zenmux.ai/) | ✅ | ❌ | 🚫 | 
-| [**ChatGPT**](https://chatgpt.com/) | ✅ | ✅ | 🚫 | 
-| [**DeepSeek**](https://chat.deepseek.com/) | ✅ | 🚫 | 🚫 | 
-| [**Sora**](https://sora.chatgpt.com/) | 🚫 | 🚫 | ✅💧 | 
-| [**Google Flow**](https://labs.google/fx/zh/tools/flow) | 🚫 | ✅ | ❌ | 
-| [**豆包**](https://www.doubao.com/) | ✅ | ✅ | ❌ | 
+| [**Google Gemini**](https://gemini.google.com/) | ✅ | ✅💧 | ✅💧 |
+| [**ZenMux**](https://zenmux.ai/) | ✅ | ❌ | 🚫 |
+| [**ChatGPT**](https://chatgpt.com/) | ✅ | ✅ | 🚫 |
+| [**DeepSeek**](https://chat.deepseek.com/) | ✅ | 🚫 | 🚫 |
+| [**Sora**](https://sora.chatgpt.com/) | 🚫 | 🚫 | ✅💧 |
+| [**Google Flow**](https://labs.google/fx/zh/tools/flow) | 🚫 | ✅ | ❌ |
+| [**豆包**](https://www.doubao.com/) | ✅ | ✅ | ❌ |
+| [**Kimi**](https://www.kimi.com/) | ✅ | ❌ | 🚫 |
+| [**文心一言**](https://yiyan.baidu.com/) | ✅ | ❌ | 🚫 |
+| [**通义千问**](https://www.qianwen.com/) | ✅ | ❌ | 🚫 |
 | 待续... | - | - | - | 
 
 > [!NOTE]

@@ -39,18 +39,21 @@
 ### 📋 Supported Platforms
 
 | Website | Text Gen | Image Gen | Video Gen |
-| :--- | :---: | :---: | :---: | 
+| :--- | :---: | :---: | :---: |
 | [**LMArena**](https://lmarena.ai/) | ✅ | ✅ | 🚫 |
 | [**Gemini Enterprise Business**](https://business.gemini.google/) | ✅ | ✅ | ✅ |
 | [**Nano Banana Free**](https://nanobananafree.ai/) | 🚫 | ✅ | 🚫 |
 | [**zAI**](https://zai.is/) | ✅ | ✅ | 🚫 |
-| [**Google Gemini**](https://gemini.google.com/) | ✅ | ✅💧 | ✅💧 | 
-| [**ZenMux**](https://zenmux.ai/) | ✅ | ❌ | 🚫 | 
-| [**ChatGPT**](https://chatgpt.com/) | ✅ | ✅ | 🚫 | 
-| [**DeepSeek**](https://chat.deepseek.com/) | ✅ | 🚫 | 🚫 | 
-| [**Sora**](https://sora.chatgpt.com/) | 🚫 | 🚫 | ✅💧 | 
-| [**Google Flow**](https://labs.google/fx/zh/tools/flow) | 🚫 | ✅ | ❌ | 
-| [**Doubao**](https://www.doubao.com/) | ✅ | ✅ | ❌ | 
+| [**Google Gemini**](https://gemini.google.com/) | ✅ | ✅💧 | ✅💧 |
+| [**ZenMux**](https://zenmux.ai/) | ✅ | ❌ | 🚫 |
+| [**ChatGPT**](https://chatgpt.com/) | ✅ | ✅ | 🚫 |
+| [**DeepSeek**](https://chat.deepseek.com/) | ✅ | 🚫 | 🚫 |
+| [**Sora**](https://sora.chatgpt.com/) | 🚫 | 🚫 | ✅💧 |
+| [**Google Flow**](https://labs.google/fx/zh/tools/flow) | 🚫 | ✅ | ❌ |
+| [**Doubao**](https://www.doubao.com/) | ✅ | ✅ | ❌ |
+| [**Kimi**](https://www.kimi.com/) | ✅ | ❌ | 🚫 |
+| [**Yiyan (ERNIE Bot)**](https://yiyan.baidu.com/) | ✅ | ❌ | 🚫 |
+| [**Qwen (Tongyi)**](https://www.qianwen.com/) | ✅ | ❌ | 🚫 |
 | To be continued... | - | - | - | 
 
 > [!NOTE]
