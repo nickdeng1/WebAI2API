@@ -10,7 +10,8 @@ import {
 import {
     normalizePageError,
     waitForInput,
-    gotoWithCheck
+    gotoWithCheck,
+    waitApiResponse
 } from '../utils/index.js';
 import { logger } from '../../utils/logger.js';
 
@@ -82,13 +83,13 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         // 检查是否有错误提示
         try {
-            const errorText = await page.locator('text=/System is currently busy|系统繁忙|请稍后再试|登录|Sign in|Login/').first().textContent({ timeout: 3000 }).catch(() => null);
+            const errorText = await page.locator('text=/系统繁忙|请稍后再试|请登录|Sign in|Login/').first().textContent({ timeout: 3000 }).catch(() => null);
             if (errorText) {
                 logger.warn('适配器', `检测到页面提示: ${errorText}`, meta);
-                if (errorText.includes('登录') || errorText.includes('Sign in') || errorText.includes('Login')) {
+                if (errorText.includes('请登录') || errorText.includes('Sign in') || errorText.includes('Login')) {
                     return { error: '需要登录 Kimi 账户，请先在浏览器中登录' };
                 }
-                if (errorText.includes('busy') || errorText.includes('繁忙')) {
+                if (errorText.includes('繁忙')) {
                     return { error: 'Kimi 系统繁忙，请稍后再试' };
                 }
             }
@@ -121,17 +122,12 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             return { error: '未找到输入框，请检查 Kimi 页面结构或是否已登录' };
         }
 
-        // 2. 输入提示词
-        logger.info('适配器', '输入提示词...', meta);
-
-        // 尝试多种方式聚焦输入框
+        // 2. 聚焦输入框
         try {
-            // 方式1: 直接 focus
             await inputLocator.focus({ timeout: 10000 });
             logger.debug('适配器', '使用 focus() 聚焦输入框', meta);
         } catch (e) {
             logger.debug('适配器', `focus 失败: ${e.message}，尝试 force click`, meta);
-            // 方式2: 强制点击
             try {
                 await inputLocator.click({ force: true, timeout: 10000 });
             } catch (e2) {
@@ -139,78 +135,25 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             }
         }
 
+        // 3. 启动 API 监听 - 使用 waitApiResponse 被动等待完整响应
+        logger.debug('适配器', '启动网络请求监听...', meta);
+
+        // 先启动响应等待 (Promise)，再输入和发送
+        const apiResponsePromise = waitApiResponse(page, {
+            urlMatch: 'ChatService/Chat',
+            method: 'POST',
+            timeout: waitTimeout,
+            meta
+        });
+
+        // 4. 输入提示词
+        logger.info('适配器', '输入提示词...', meta);
+
         await sleep(500, 800);
         await humanType(page, inputLocator, prompt);
         await sleep(300, 500);
 
-        // 3. 启动 API 监听 (监控所有网络请求以找到正确的端点)
-        logger.debug('适配器', '启动网络请求监听...', meta);
-
-        let resultText = '';
-        let isComplete = false;
-        let foundApiEndpoint = null;
-
-        // 监听所有响应，记录 API 端点
-        const logAllResponses = (response) => {
-            const url = response.url();
-            const method = response.request().method();
-            const status = response.status();
-            const contentType = response.headers()['content-type'] || '';
-
-            // 只记录可能的 API 调用 (Kimi 使用 www.kimi.com/apiv2/)
-            if (method === 'POST' && status === 200 && url.includes('kimi.com')) {
-                logger.info('适配器', `发现 Kimi API: ${method} ${url} (${contentType.substring(0, 50)})`, meta);
-                if (contentType.includes('event-stream') || contentType.includes('octet-stream')) {
-                    foundApiEndpoint = url;
-                }
-            }
-        };
-        page.on('response', logAllResponses);
-
-        // Kimi 使用 WebSocket 或 Connect RPC 流式传输，需要监听多种响应类型
-        // Connect RPC 使用 application/connect+json 或 application/connect+proto
-        const responsePromise = page.waitForResponse(async (response) => {
-            const url = response.url();
-            const method = response.request().method();
-            const status = response.status();
-            const contentType = response.headers()['content-type'] || '';
-
-            // 匹配 Kimi 的聊天 API (Connect RPC)
-            // 主要端点: kimi.gateway.chat.v1.ChatService/Chat
-            if (!url.includes('ChatService/Chat')) return false;
-            if (method !== 'POST') return false;
-            if (status !== 200) return false;
-
-            logger.info('适配器', `匹配到 Connect RPC 响应: ${url}`, meta);
-            logger.debug('适配器', `内容类型: ${contentType}`, meta);
-
-            try {
-                const body = await response.text();
-                logger.info('适配器', `响应内容长度: ${body.length}`, meta);
-                // 打印前2000字符用于调试
-                if (body.length > 0) {
-                    logger.debug('适配器', `响应内容预览: ${body.substring(0, 2000)}`, meta);
-                }
-
-                // Connect RPC 使用特殊的流式格式
-                // 每行是一个 JSON 对象，带有特定字段
-                const parsed = parseConnectRpcResponse(body);
-                logger.debug('适配器', `解析结果: text=${parsed.text.length}字符, complete=${parsed.complete}`, meta);
-                if (parsed.text) {
-                    resultText = parsed.text;
-                }
-                if (parsed.complete) {
-                    isComplete = true;
-                }
-
-                return isComplete;
-            } catch (e) {
-                logger.warn('适配器', `响应解析错误: ${e.message}`, meta);
-                return false;
-            }
-        }, { timeout: waitTimeout });
-
-        // 4. 点击发送按钮 (尝试多个选择器)
+        // 5. 点击发送按钮 (尝试多个选择器)
         logger.debug('适配器', '寻找发送按钮...', meta);
 
         const sendSelectors = [
@@ -254,67 +197,54 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             await page.keyboard.press('Enter');
         }
 
-        // 5. 等待响应 - 监听两种方式：API 响应和页面元素变化
+        // 6. 等待响应
         logger.info('适配器', '等待生成结果...', meta);
 
-        // 方式1: 等待页面上的回复内容出现（更可靠）
-        // Kimi 页面上显示回复后会有特定的元素结构
-        const replyPromise = page.waitForFunction(() => {
-            // 检查页面上是否有回复内容
-            // Kimi 的回复通常在 message-item 或类似元素中
-            const replyElements = document.querySelectorAll('[class*="message"], [class*="reply"], [class*="response"]');
-            for (const el of replyElements) {
-                // 跳过用户发送的消息（通常有 user 或 input 标识）
-                if (el.className.includes('user') || el.className.includes('input')) continue;
-                const text = el.textContent || '';
-                // 检查是否有足够的文本内容（非空且不是 loading 提示）
-                if (text.length > 10 && !text.includes('正在思考') && !text.includes('thinking') && !text.includes('...')) {
-                    return text;
-                }
-            }
-            return null;
-        }, { timeout: waitTimeout }).catch(e => {
-            logger.warn('适配器', `页面回复等待失败: ${e.message}`, meta);
-            return null;
-        });
+        let resultText = '';
+        let collectedReferences = [];
 
-        // 方式2: 等待 API 响应完成（作为补充）
         try {
-            // 等待一段时间让 Kimi 生成响应
-            const apiResult = await Promise.race([
-                responsePromise,
-                replyPromise.then(text => {
-                    if (text) {
-                        resultText = text;
-                        isComplete = true;
-                    }
-                    return isComplete;
-                })
-            ]);
+            const response = await apiResponsePromise;
+            // Connect RPC 使用二进制前缀，必须用 body() 获取原始 Buffer
+            // 不能用 text()，因为 UTF-8 解码会破坏二进制长度字段
+            const bodyBuffer = await response.body();
+            logger.info('适配器', `ConnectRPC 响应接收完成，长度: ${bodyBuffer.length}`, meta);
 
-            if (isComplete && resultText) {
-                logger.info('适配器', `从页面获取到回复内容 (${resultText.length} 字符)`, meta);
-            }
+            // 解析 Connect RPC 响应
+            const parsed = parseConnectRpcResponse(bodyBuffer, meta);
+            logger.info('适配器', `解析结果: text=${parsed.text.length}字符, refs=${parsed.references.length}, complete=${parsed.complete}`, meta);
+            resultText = parsed.text || '';
+            collectedReferences = parsed.references || [];
         } catch (e) {
-            // 检查页面上的回复内容
-            const pageReply = await replyPromise;
-            if (pageReply) {
-                resultText = pageReply;
-                logger.info('适配器', `从页面获取到回复内容 (${resultText.length} 字符)`, meta);
+            if (e.message?.includes('API_TIMEOUT')) {
+                logger.warn('适配器', '等待 ConnectRPC 超时', meta);
             } else {
-                // 打印发现的 API 端点信息
-                if (foundApiEndpoint) {
-                    logger.info('适配器', `发现的 SSE 端点: ${foundApiEndpoint}`, meta);
-                }
-                page.off('response', logAllResponses);
-                const pageError = normalizePageError(e, meta);
-                if (pageError) return pageError;
-                throw e;
+                logger.warn('适配器', `等待 ConnectRPC 失败: ${e.message}`, meta);
             }
         }
 
-        // 清理监听器
-        page.off('response', logAllResponses);
+        // 如果 API 响应没获取到内容，尝试从页面 DOM 获取
+        if (!resultText || resultText.trim().length < 10) {
+            logger.debug('适配器', 'ConnectRPC 未获取到内容，尝试从 DOM 获取...', meta);
+            await sleep(2000, 3000);
+            try {
+                const pageReply = await page.evaluate(() => {
+                    const replyElements = document.querySelectorAll('[class*="message"], [class*="reply"], [class*="response"]');
+                    for (const el of replyElements) {
+                        if (el.className.includes('user') || el.className.includes('input')) continue;
+                        const text = el.textContent || '';
+                        if (text.length > 10 && !text.includes('正在思考') && !text.includes('thinking')) {
+                            return text;
+                        }
+                    }
+                    return null;
+                });
+                if (pageReply && pageReply.trim().length > 20) {
+                    resultText = pageReply.trim();
+                    logger.info('适配器', `从 DOM 获取到回复 (${resultText.length} 字符)`, meta);
+                }
+            } catch {}
+        }
 
         if (!resultText || resultText.trim() === '') {
             logger.warn('适配器', '回复内容为空', meta);
@@ -322,9 +252,21 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         }
 
         logger.info('适配器', `已获取文本内容 (${resultText.length} 字符)`, meta);
+
+        // 拼接搜索引用
+        let finalText = resultText.trim();
+        if (collectedReferences.length > 0) {
+            const refsText = '\n\n---\n**参考资料：**\n' + collectedReferences.map((ref, i) => {
+                const siteLabel = ref.site ? ` (${ref.site})` : '';
+                return `- [${i + 1}] ${ref.title}${siteLabel}: ${ref.url}`;
+            }).join('\n');
+            finalText += refsText;
+            logger.info('适配器', `已提取 ${collectedReferences.length} 条搜索引用`, meta);
+        }
+
         logger.info('适配器', '文本生成完成，任务完成', meta);
 
-        return { text: resultText.trim() };
+        return { text: finalText };
 
     } catch (err) {
         const pageError = normalizePageError(err, meta);
@@ -336,165 +278,102 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 }
 
 /**
- * 解析 SSE 响应体，提取最终文本
- * @param {string} body - SSE 响应体
- * @returns {{text: string, complete: boolean}}
- */
-function parseSSEResponse(body) {
-    const lines = body.split('\n');
-    let resultText = '';
-    let isComplete = false;
-
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-
-        // 解析 SSE 格式
-        if (line.startsWith('data:')) {
-            const dataStr = line.substring(5).trim();
-            if (!dataStr || dataStr === '[DONE]' || dataStr === '{}') {
-                if (dataStr === '[DONE]') {
-                    isComplete = true;
-                }
-                continue;
-            }
-
-            try {
-                const data = JSON.parse(dataStr);
-
-                // OpenAI 兼容格式 (Kimi 可能使用)
-                if (data.choices && Array.isArray(data.choices)) {
-                    for (const choice of data.choices) {
-                        const delta = choice.delta;
-                        if (delta && delta.content) {
-                            resultText += delta.content;
-                        }
-                        // 检查完成标记
-                        if (choice.finish_reason) {
-                            isComplete = true;
-                        }
-                    }
-                }
-
-                // 其他可能的格式
-                if (data.text) {
-                    resultText += data.text;
-                }
-                if (data.content) {
-                    resultText += data.content;
-                }
-                if (data.message) {
-                    resultText += data.message;
-                }
-
-                // 完成标记
-                if (data.done === true || data.is_end === true || data.finish === true) {
-                    isComplete = true;
-                }
-
-            } catch {
-                // JSON 解析失败，跳过
-            }
-        }
-
-        // 检查 event 行的完成标记
-        if (line.startsWith('event:')) {
-            const eventType = line.substring(6).trim();
-            if (eventType === 'done' || eventType === 'end' || eventType === 'finish') {
-                isComplete = true;
-            }
-        }
-    }
-
-    return { text: resultText, complete: isComplete };
-}
-
-/**
- * 解析 Connect RPC 响应体，提取最终文本
- * Connect RPC 格式：每个消息前有长度前缀（5字节不可见字符），然后是 JSON
- * Kimi 格式:
+ * 解析 Connect RPC 响应体，提取最终文本和搜索引用
+ * Connect RPC streaming 格式: 每个消息 = 1字节flags + 4字节长度(N) + N字节JSON body
+ * Kimi JSON 格式:
  *   {"op":"set", "mask":"block.text", "block":{"text":{"content":"你好"}}}
  *   {"op":"append", "mask":"block.text.content", "block":{"text":{"content":"！"}}}
- * @param {string} body - Connect RPC 响应体
- * @returns {{text: string, complete: boolean}}
+ *   搜索引用: message.refs.searchChunks 中包含 url 和 title
+ * @param {Buffer} buf - Connect RPC 原始响应 Buffer（由 response.body() 获取）
+ * @param {object} [meta={}] - 日志元数据
+ * @returns {{text: string, complete: boolean, references: Array}}
  */
-function parseConnectRpcResponse(body) {
+function parseConnectRpcResponse(buf, meta = {}) {
     let resultText = '';
     let isComplete = false;
+    const references = [];
 
-    // Connect RPC 流式响应包含长度前缀和 JSON 内容
-    // 消息格式: [5字节长度][JSON对象][5字节长度][JSON对象]...
-    // 我们需要找到所有 JSON 对象
+    let offset = 0;
+    let msgCount = 0;
+    let skippedCount = 0;
 
-    // 方法：找到所有 { 开始的位置，然后解析 JSON
-    let pos = 0;
-    while (pos < body.length) {
-        // 找到下一个 { 的位置
-        const braceIndex = body.indexOf('{', pos);
-        if (braceIndex === -1) break;
+    while (offset < buf.length - 5) {
+        // 读取 5 字节前缀: 1字节 flags + 4字节消息长度 (big-endian)
+        const flags = buf[offset];
+        const msgLen = buf.readUInt32BE(offset + 1);
 
-        // 从这个位置尝试解析 JSON
-        // JSON 对象可能很长，需要找到完整的 JSON
-        let jsonStr = '';
-        let depth = 0;
-        let start = braceIndex;
-
-        for (let i = braceIndex; i < body.length; i++) {
-            const char = body[i];
-            if (char === '{') depth++;
-            else if (char === '}') depth--;
-
-            if (depth === 0) {
-                jsonStr = body.substring(start, i + 1);
-                pos = i + 1;
-                break;
-            }
-        }
-
-        if (!jsonStr || depth !== 0) {
-            pos = braceIndex + 1;
+        // 合理性检查：消息长度不能超过剩余数据，且不能过大
+        if (msgLen <= 0 || msgLen > buf.length - offset - 5 || msgLen > 10 * 1024 * 1024) {
+            skippedCount++;
+            offset++;
             continue;
         }
 
+        const msgStart = offset + 5;
+        const msgEnd = msgStart + msgLen;
+        const jsonStr = buf.subarray(msgStart, msgEnd).toString('utf-8');
+        msgCount++;
+
         try {
             const data = JSON.parse(jsonStr);
+            if (!data.heartbeat) {
+                // 提取文本内容
+                if (data.op === 'set' || data.op === 'append') {
+                    const block = data.block;
+                    if (block) {
+                        if (block.text && block.text.content) {
+                            resultText += block.text.content;
+                        }
+                    }
 
-            // 跳过心跳消息
-            if (data.heartbeat) continue;
-
-            // Kimi 流式文本格式
-            // 1. op="set" + mask="block.text" 初始化文本块
-            // 2. op="append" + mask="block.text.content" 增量追加文本
-            if (data.op === 'set' || data.op === 'append') {
-                const block = data.block;
-                if (block && block.text && block.text.content) {
-                    resultText += block.text.content;
-                }
-            }
-
-            // 检查消息状态完成
-            if (data.message && data.message.status) {
-                if (data.message.status === 'MESSAGE_STATUS_COMPLETED') {
-                    // 如果是 assistant 消息完成，则标记完成
-                    if (data.message.role === 'assistant') {
-                        isComplete = true;
+                    // 从 message.refs.searchChunks 提取搜索引用
+                    // Kimi 格式: data.message.refs.searchChunks[].base = { title, url, siteName }
+                    if (data.message && data.message.refs) {
+                        const refs = data.message.refs;
+                        // searchChunks - 搜索结果列表
+                        if (refs.searchChunks && Array.isArray(refs.searchChunks)) {
+                            for (const chunk of refs.searchChunks) {
+                                const base = chunk.base || chunk;
+                                if (base.url && !references.some(r => r.url === base.url)) {
+                                    references.push({
+                                        url: base.url,
+                                        title: base.title || base.name || '',
+                                        site: base.siteName || base.site || ''
+                                    });
+                                }
+                            }
+                        }
+                        // usedSearchChunks - 实际使用的引用
+                        if (refs.usedSearchChunks && Array.isArray(refs.usedSearchChunks)) {
+                            for (const chunk of refs.usedSearchChunks) {
+                                const base = chunk.base || chunk;
+                                if (base.url && !references.some(r => r.url === base.url)) {
+                                    references.push({
+                                        url: base.url,
+                                        title: base.title || base.name || '',
+                                        site: base.siteName || base.site || ''
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
-            }
 
-            // 旧的格式检查（备用）
-            if (data.op === 'set' && data.message) {
-                const message = data.message;
-                if (message.text) resultText += message.text;
-                if (message.content) resultText += message.content;
+                // 检查完成标记 - Kimi 的 role 可能不在同一条消息里
+                if (data.message && data.message.status === 'MESSAGE_STATUS_COMPLETED') {
+                    isComplete = true;
+                }
             }
-
-        } catch (e) {
+        } catch {
             // JSON 解析失败，跳过
-            pos = braceIndex + 1;
         }
+
+        offset = msgEnd;
     }
 
-    return { text: resultText, complete: isComplete };
+    logger.info('适配器', `ConnectRPC 解析统计: 总消息=${msgCount}, 跳过=${skippedCount}, 文本=${resultText.length}字符, 引用=${references.length}, complete=${isComplete}`, meta);
+
+    return { text: resultText, complete: isComplete, references };
 }
 
 /**

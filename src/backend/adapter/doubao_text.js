@@ -144,6 +144,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         let resultText = '';
         let reasoningText = '';
+        let referencesText = '';
         let isResolved = false;
 
         const resultPromise = new Promise((resolve, reject) => {
@@ -171,6 +172,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                     if (result.text) {
                         resultText = result.text;
                         reasoningText = result.reasoning || '';
+                        referencesText = result.references || '';
 
                         if (!isResolved) {
                             isResolved = true;
@@ -199,9 +201,16 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         if (resultText) {
             logger.info('适配器', `生成完成，文本长度: ${resultText.length}`, meta);
-            const result = { text: resultText };
+
+            // 将参考资料添加到正文后面
+            const fullText = resultText + (referencesText || '');
+
+            const result = { text: fullText };
             if (reasoningText) {
                 result.reasoning = reasoningText;
+            }
+            if (referencesText) {
+                logger.info('适配器', `已提取参考资料`, meta);
             }
             return result;
         } else {
@@ -218,17 +227,22 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 }
 
 /**
- * 解析 SSE 响应体，提取最终文本
+ * 解析 SSE 响应体，提取最终文本和参考资料
  * @param {string} body - SSE 响应体
  * @param {boolean} useThinking - 是否使用深度思考模式
- * @returns {{text: string, reasoning?: string}}
+ * @returns {{text: string, reasoning?: string, references?: string}}
  */
 function parseSSEResponse(body, useThinking) {
     const lines = body.split('\n');
     let resultText = '';
     let reasoningText = '';
+    let referencesText = '';
     let inThinkingBlock = false;
     let thinkingBlockId = null;
+    let referenceLinks = []; // 收集参考资料链接
+
+    // 调试：记录所有 block_type
+    const blockTypesFound = new Set();
 
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i].trim();
@@ -257,9 +271,19 @@ function parseSSEResponse(body, useThinking) {
                     if (eventType === 'STREAM_MSG_NOTIFY') {
                         const blocks = data.content?.content_block || [];
                         for (const block of blocks) {
+                            blockTypesFound.add(block.block_type);
                             if (block.block_type === 10040 && block.content?.thinking_block) {
                                 inThinkingBlock = true;
                                 thinkingBlockId = block.block_id;
+                            }
+                            // 提取其他链接块
+                            if (block.content?.link_block) {
+                                const linkInfo = block.content.link_block;
+                                const title = linkInfo.title || '参考';
+                                const url = linkInfo.url || '';
+                                if (url) {
+                                    referenceLinks.push(`${title}: ${url}`);
+                                }
                             }
                         }
                     }
@@ -269,6 +293,7 @@ function parseSSEResponse(body, useThinking) {
                         for (const op of data.patch_op) {
                             if (op.patch_object === 1 && op.patch_value?.content_block) {
                                 for (const block of op.patch_value.content_block) {
+                                    blockTypesFound.add(block.block_type);
                                     // 思考块结束标记
                                     if (block.block_type === 10040 && block.is_finish) {
                                         inThinkingBlock = false;
@@ -282,6 +307,31 @@ function parseSSEResponse(body, useThinking) {
                                     else if (block.block_type === 10000 && block.parent_id !== thinkingBlockId) {
                                         const text = block.content?.text_block?.text || '';
                                         if (text) resultText += text;
+                                    }
+                                    // 提取搜索结果参考资料 (block_type 10025)
+                                    if (block.block_type === 10025 && block.content?.search_query_result_block) {
+                                        const searchResult = block.content.search_query_result_block;
+                                        const results = searchResult.results || [];
+                                        for (const result of results) {
+                                            if (result.text_card) {
+                                                const card = result.text_card;
+                                                const title = card.title || '参考资料';
+                                                const url = card.url || '';
+                                                const sitename = card.sitename || '';
+                                                if (url) {
+                                                    referenceLinks.push(`[${sitename}] ${title}: ${url}`);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // 提取其他链接块
+                                    if (block.content?.link_block) {
+                                        const linkInfo = block.content.link_block;
+                                        const title = linkInfo.title || '参考';
+                                        const url = linkInfo.url || '';
+                                        if (url) {
+                                            referenceLinks.push(`${title}: ${url}`);
+                                        }
                                     }
                                 }
                             }
@@ -307,7 +357,13 @@ function parseSSEResponse(body, useThinking) {
         }
     }
 
-    return { text: resultText, reasoning: reasoningText };
+    
+    // 如果有参考资料，添加到结果中
+    if (referenceLinks.length > 0) {
+        referencesText = '\n\n---\n**参考资料：**\n' + referenceLinks.map(link => `- ${link}`).join('\n');
+    }
+
+    return { text: resultText, reasoning: reasoningText, references: referencesText };
 }
 
 /**

@@ -15,7 +15,7 @@ import {
 import { logger } from '../../utils/logger.js';
 
 // --- 配置常量 ---
-const TARGET_URL = 'https://yiyan.baidu.com/';
+const TARGET_URL = 'https://chat.baidu.com/';
 
 // 输入框可能的选择器列表 (按优先级排序)
 const INPUT_SELECTORS = [
@@ -80,10 +80,10 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         // 检查是否有错误提示
         try {
-            const errorText = await page.locator('text=/请登录|登录|Sign in|Login|系统繁忙/').first().textContent({ timeout: 3000 }).catch(() => null);
+            const errorText = await page.locator('text=/请登录|Sign in|Login|系统繁忙/').first().textContent({ timeout: 3000 }).catch(() => null);
             if (errorText) {
                 logger.warn('适配器', `检测到页面提示: ${errorText}`, meta);
-                if (errorText.includes('登录') || errorText.includes('Sign in') || errorText.includes('Login')) {
+                if (errorText.includes('请登录') || errorText.includes('Sign in') || errorText.includes('Login')) {
                     return { error: '需要登录百度账户，请先在浏览器中登录文心一言' };
                 }
                 if (errorText.includes('繁忙')) {
@@ -132,40 +132,41 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         await humanType(page, inputLocator, prompt);
         await sleep(300, 500);
 
-        // 3. 启动 API 监听
+        // 3. 启动 API 监听 - 使用 route 拦截 SSE 响应
         logger.debug('适配器', '启动网络请求监听...', meta);
 
         let resultText = '';
         let isComplete = false;
-        let wsReceived = false;
+        let collectedReferences = [];
+        let sseResolve = null;
+        const ssePromise = new Promise(resolve => { sseResolve = resolve; });
 
-        // 监听 WebSocket 消息
-        page.on('websocket', ws => {
-            logger.info('适配器', `发现 WebSocket: ${ws.url()}`, meta);
-            ws.on('framereceived', frame => {
-                try {
-                    const payload = frame.payload;
-                    if (payload && typeof payload === 'string') {
-                        logger.debug('适配器', `WebSocket 消息: ${payload.substring(0, 500)}`, meta);
-                        // 尝试解析 WebSocket 消息
-                        try {
-                            const data = JSON.parse(payload);
-                            // 检查是否有文本内容
-                            if (data.content || data.text || data.message) {
-                                resultText += (data.content || data.text || data.message);
-                                wsReceived = true;
-                            }
-                            // 检查是否有 SSE 格式数据
-                            if (data.data && data.data.content) {
-                                resultText += data.data.content;
-                                wsReceived = true;
-                            }
-                        } catch {}
+        // 使用 page.route 拦截 SSE 响应并读取流
+        await page.route('**/aichat/api/conversation**', async (route) => {
+            try {
+                const response = await route.fetch();
+                const body = await response.text();
+                logger.info('适配器', `route 拦截到 SSE 响应，长度: ${body.length}`, meta);
+
+                // 解析 SSE 数据
+                const parsed = parseResponse(body, meta);
+                logger.info('适配器', `解析结果: text=${parsed.text.length}字符, references=${parsed.references.length}, complete=${parsed.complete}`, meta);
+                if (parsed.text) resultText = parsed.text;
+                if (parsed.references && parsed.references.length > 0) {
+                    for (const ref of parsed.references) {
+                        if (ref.url && !collectedReferences.some(r => r.url === ref.url)) {
+                            collectedReferences.push(ref);
+                        }
                     }
-                } catch (e) {
-                    logger.debug('适配器', `WebSocket 解析失败: ${e.message}`, meta);
                 }
-            });
+                isComplete = true;
+                if (sseResolve) { sseResolve(); sseResolve = null; }
+
+                await route.fulfill({ response });
+            } catch (e) {
+                logger.warn('适配器', `route 拦截错误: ${e.message}`, meta);
+                try { await route.continue(); } catch {}
+            }
         });
 
         // 监听所有响应，记录 API 端点
@@ -176,7 +177,6 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             const contentType = response.headers()['content-type'] || '';
 
             if (method === 'POST' && status === 200 && (
-                url.includes('yiyan') ||
                 url.includes('chat') ||
                 url.includes('completion') ||
                 url.includes('stream')
@@ -185,97 +185,6 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             }
         };
         page.on('response', logAllResponses);
-
-        // 监听 SSE 响应 - 文心一言使用 eb/chat/conversation/v2
-        // 同时监听 history API 获取完整回复
-        const handleResponse = async (response) => {
-            const url = response.url();
-            const method = response.request().method();
-            const status = response.status();
-
-            // 文心一言聊天 API: eb/chat/conversation/v2 (SSE)
-            if (url.includes('eb/chat/conversation') && method === 'POST' && status === 200) {
-                logger.info('适配器', `收到文心一言响应: ${url}`, meta);
-
-                try {
-                    const body = await response.text();
-                    logger.info('适配器', `响应内容长度: ${body.length}`, meta);
-                    if (body.length > 0) {
-                        logger.debug('适配器', `响应内容预览: ${body.substring(0, 2000)}`, meta);
-                    }
-
-                    // 解析 SSE 响应
-                    const parsed = parseResponse(body);
-                    logger.debug('适配器', `解析结果: text=${parsed.text.length}字符, complete=${parsed.complete}`, meta);
-                    if (parsed.text) {
-                        resultText += parsed.text;
-                    }
-                    if (parsed.complete) {
-                        isComplete = true;
-                    }
-                } catch (e) {
-                    logger.warn('适配器', `响应解析错误: ${e.message}`, meta);
-                }
-            }
-
-            // 监听 history API 获取完整回复
-            if (url.includes('eb/chat/history') && method === 'POST' && status === 200) {
-                logger.info('适配器', `收到 history 响应: ${url}`, meta);
-
-                try {
-                    const body = await response.text();
-                    logger.info('适配器', `history 响应内容长度: ${body.length}`, meta);
-                    if (body.length > 0) {
-                        logger.debug('适配器', `history 响应内容预览: ${body.substring(0, 2000)}`, meta);
-                    }
-
-                    // 解析 history 响应获取 AI 回复
-                    try {
-                        const data = JSON.parse(body);
-                        // history 响应结构: data.data.chats 是一个对象 (key: chatId, value: chat object)
-                        if (data.data && data.data.chats) {
-                            const chats = data.data.chats;
-                            // 遍历所有聊天消息
-                            for (const chatId of Object.keys(chats)) {
-                                const chat = chats[chatId];
-                                // 跳过用户消息
-                                if (chat.role === 'user') continue;
-                                // 提取 AI 回复 (role: "robot")
-                                if (chat.role === 'robot' && chat.message && Array.isArray(chat.message)) {
-                                    for (const msg of chat.message) {
-                                        if (msg.contentType === 'text' && msg.content && msg.content.trim()) {
-                                            resultText = msg.content;
-                                            isComplete = true;
-                                            logger.info('适配器', `从 history 获取到 AI 回复 (${resultText.length} 字符)`, meta);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // 兼容 chatList 数组格式 (备用)
-                        if (data.data && data.data.chatList) {
-                            for (const chat of data.data.chatList) {
-                                if (chat.role === 'user') continue;
-                                if (chat.message && Array.isArray(chat.message)) {
-                                    for (const msg of chat.message) {
-                                        if (msg.content && msg.content.trim()) {
-                                            resultText = msg.content;
-                                            isComplete = true;
-                                            logger.info('适配器', `从 chatList 获取到回复`, meta);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        logger.warn('适配器', `history 解析失败: ${e.message}`, meta);
-                    }
-                } catch (e) {
-                    logger.warn('适配器', `history 响应错误: ${e.message}`, meta);
-                }
-            }
-        };
-        page.on('response', handleResponse);
 
         // 4. 点击发送按钮
         logger.debug('适配器', '寻找发送按钮...', meta);
@@ -316,111 +225,27 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             await page.keyboard.press('Enter');
         }
 
-        // 5. 等待响应 - 使用循环等待，等待内容稳定
+        // 5. 等待响应 - 等待 SSE route 拦截完成
         logger.info('适配器', '等待生成结果...', meta);
 
-        // 循环等待，直到获取到内容且内容稳定或超时
-        const maxWaitTime = Math.min(waitTimeout, 60000); // 最大等待 60 秒
-        const startTime = Date.now();
-        let lastContentLength = 0;
-        let stableCount = 0; // 内容稳定的次数计数
-        let lastCheckTime = 0;
+        // 等待 SSE 或超时
+        const timeoutPromise = sleep(waitTimeout, waitTimeout + 1000).then(() => 'timeout');
+        const raceResult = await Promise.race([ssePromise.then(() => 'sse'), timeoutPromise]);
 
-        while (Date.now() - startTime < maxWaitTime) {
-            const elapsed = Date.now() - startTime;
-
-            // 每 500ms 检查一次
-            if (Date.now() - lastCheckTime > 500) {
-                lastCheckTime = Date.now();
-
-                // 检查是否已从 API 获取到内容
-                if (resultText && resultText.trim().length > 10) {
-                    logger.info('适配器', `已从 API 获取到内容 (${elapsed}ms)`, meta);
-                    break;
-                }
-
-                // 尝试从页面获取回复内容
-                try {
-                    const pageReply = await page.evaluate(() => {
-                        // 文心一言的回复结构：
-                        // AI 消息通常在特定的容器中，排除用户输入区域
-                        const selectors = [
-                            // 文心一言特定选择器
-                            '.chat-answer-content',
-                            '.answer-content',
-                            '[class*="answer"]',
-                            '.chat-message-robot',
-                            '[class*="robot-message"]',
-                            '[class*="ai-reply"]',
-                            '.chat-item-ai',
-                        ];
-
-                        for (const selector of selectors) {
-                            try {
-                                const elements = document.querySelectorAll(selector);
-                                for (const el of elements) {
-                                    const text = (el.textContent || '').trim();
-                                    // 排除太短的内容和用户输入
-                                    if (text.length > 20) {
-                                        // 尝试排除用户消息区域
-                                        if (el.closest('[class*="user"]') || el.closest('[class*="input"]')) continue;
-                                        return text;
-                                    }
-                                }
-                            } catch {}
-                        }
-
-                        // 通用方法：查找最新的聊天消息（排除用户输入框）
-                        const chatContainers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"]');
-                        for (const container of chatContainers) {
-                            // 跳过用户消息
-                            if (container.className.toLowerCase().includes('user')) continue;
-                            const text = (container.textContent || '').trim();
-                            if (text.length > 30 && !text.includes('输入框') && !text.includes('发送')) {
-                                return text;
-                            }
-                        }
-
-                        return null;
-                    });
-
-                    if (pageReply && typeof pageReply === 'string' && pageReply.trim().length > 20) {
-                        const currentLength = pageReply.trim().length;
-
-                        // 检查内容是否稳定（不再增长）
-                        if (currentLength === lastContentLength) {
-                            stableCount++;
-                            // 内容连续 3 次检查长度不变，认为生成完成
-                            if (stableCount >= 3) {
-                                resultText = pageReply.trim();
-                                logger.info('适配器', `从页面获取到稳定回复 (${resultText.length} 字符, 稳定计数: ${stableCount})`, meta);
-                                break;
-                            }
-                        } else if (currentLength > lastContentLength) {
-                            // 内容还在增长，重置稳定计数
-                            stableCount = 0;
-                            lastContentLength = currentLength;
-                            logger.debug('适配器', `内容增长中 (${currentLength} 字符)`, meta);
-                        }
-                    }
-                } catch (e) {
-                    // 页面评估失败，继续等待
-                }
-            }
-
-            // 等待 300ms 后再次检查
-            await sleep(200, 400);
+        if (raceResult === 'sse') {
+            logger.info('适配器', 'SSE 响应接收完成', meta);
+        } else {
+            logger.warn('适配器', '等待 SSE 超时', meta);
         }
 
-        // 如果循环等待后仍未获取内容，再等待一段时间让 history API 可能返回
+        // 如果 SSE 没有获取到内容，尝试从页面 DOM 获取
         if (!resultText || resultText.trim().length < 10) {
-            logger.debug('适配器', '循环等待结束，额外等待 3 秒检查 history...', meta);
-            await sleep(2500, 3500);
+            logger.debug('适配器', 'SSE 未获取到内容，尝试从 DOM 获取...', meta);
+            await sleep(2000, 3000);
 
-            // 最后一次尝试从页面获取
             try {
                 const pageReply = await page.evaluate(() => {
-                    const selectors = ['.chat-answer-content', '.answer-content', '[class*="answer"]'];
+                    const selectors = ['.chat-answer-content', '.answer-content', '[class*="answer"]', '[class*="msg-content"]', '[class*="response-content"]'];
                     for (const selector of selectors) {
                         const elements = document.querySelectorAll(selector);
                         for (const el of elements) {
@@ -435,14 +260,14 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 });
                 if (pageReply && pageReply.trim().length > 20) {
                     resultText = pageReply.trim();
-                    logger.info('适配器', `最后一次尝试获取成功 (${resultText.length} 字符)`, meta);
+                    logger.info('适配器', `从 DOM 获取到回复 (${resultText.length} 字符)`, meta);
                 }
             } catch {}
         }
 
         // 清理监听器
-        page.off('response', handleResponse);
         page.off('response', logAllResponses);
+        try { await page.unroute('**/aichat/api/conversation**'); } catch {}
 
         // 确保 resultText 是字符串
         if (typeof resultText !== 'string') {
@@ -455,9 +280,21 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         }
 
         logger.info('适配器', `已获取文本内容 (${resultText.length} 字符)`, meta);
+
+        // 拼接搜索引用到正文末尾
+        let finalText = resultText.trim();
+        if (collectedReferences.length > 0) {
+            const refsText = '\n\n---\n**参考资料：**\n' + collectedReferences.map((ref, i) => {
+                const siteLabel = ref.site ? ` (${ref.site})` : '';
+                return `- [${i + 1}] ${ref.title}${siteLabel}: ${ref.url}`;
+            }).join('\n');
+            finalText += refsText;
+            logger.info('适配器', `已提取 ${collectedReferences.length} 条搜索引用`, meta);
+        }
+
         logger.info('适配器', '文本生成完成，任务完成', meta);
 
-        return { text: resultText.trim() };
+        return { text: finalText };
 
     } catch (err) {
         const pageError = normalizePageError(err, meta);
@@ -469,156 +306,111 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 }
 
 /**
- * 解析响应体（支持 SSE 和 JSON 格式）
- * 文心一言格式：event:major + data:{createChatResponseVoCommonResult:{chat:{...}}}
- * AI 回复在 parentChat 或后续消息的 content 字段中
+ * 解析 chat.baidu.com SSE 响应体
+ * SSE 格式: event:message\ndata:{...}\n\n
+ * 数据结构: data.data.message.content.generator.data.value = 增量 markdown 文本
+ * 搜索引用: data.data.message.content.generator.data.searchCitations.list[]
  * @param {string} body - 响应体
- * @returns {{text: string, complete: boolean}}
+ * @param {object} [meta={}] - 日志元数据
+ * @returns {{text: string, complete: boolean, references: Array}}
  */
-function parseResponse(body) {
+function parseResponse(body, meta = {}) {
     let resultText = '';
     let isComplete = false;
+    const references = [];
 
-    // 文心一言 SSE 格式
-    if (body.includes('event:') && body.includes('data:')) {
-        const lines = body.split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            // 解析 data 行
-            if (trimmed.startsWith('data:')) {
-                const dataStr = trimmed.substring(5).trim();
-                if (!dataStr || dataStr === '[DONE]') {
-                    if (dataStr === '[DONE]') isComplete = true;
-                    continue;
-                }
-
-                try {
-                    const data = JSON.parse(dataStr);
-
-                    // 文心一言格式：data.createChatResponseVoCommonResult
-                    if (data.data && data.data.createChatResponseVoCommonResult) {
-                        const result = data.data.createChatResponseVoCommonResult.data;
-
-                        // parentChat 是 AI 的回复容器
-                        if (result.parentChat) {
-                            const parentChat = result.parentChat;
-                            // 检查 message 数组
-                            if (parentChat.message && Array.isArray(parentChat.message)) {
-                                for (const msg of parentChat.message) {
-                                    if (msg.content) {
-                                        resultText += msg.content;
-                                    }
-                                    if (msg.text) {
-                                        resultText += msg.text;
-                                    }
-                                }
-                            }
-                            // 检查是否有完成标记
-                            if (parentChat.stop || parentChat.mode === 'finish') {
-                                isComplete = true;
-                            }
-                        }
-
-                        // chat 是用户消息或后续 AI 消息
-                        if (result.chat) {
-                            const chat = result.chat;
-                            // 跳过用户消息 (role: "user")
-                            if (chat.role === 'robot' && chat.message) {
-                                for (const msg of chat.message) {
-                                    if (msg.content) {
-                                        resultText += msg.content;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // OpenAI 兼容格式 (备用)
-                    if (data.choices && Array.isArray(data.choices)) {
-                        for (const choice of data.choices) {
-                            const delta = choice.delta;
-                            if (delta && delta.content) {
-                                resultText += delta.content;
-                            }
-                            if (choice.finish_reason) {
-                                isComplete = true;
-                            }
-                        }
-                    }
-
-                    // 其他可能的格式
-                    if (data.result && typeof data.result === 'string') {
-                        resultText += data.result;
-                    }
-                    if (data.text) {
-                        resultText += data.text;
-                    }
-                    if (data.content) {
-                        resultText += data.content;
-                    }
-
-                    if (data.is_end || data.done || data.finish) {
-                        isComplete = true;
-                    }
-                } catch {}
-            }
-        }
-    } else if (body.includes('data:')) {
-        // 简单 SSE 格式
-        const lines = body.split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (trimmed.startsWith('data:')) {
-                const dataStr = trimmed.substring(5).trim();
-                if (!dataStr) continue;
-                try {
-                    const data = JSON.parse(dataStr);
-                    if (data.result) resultText += data.result;
-                    if (data.text) resultText += data.text;
-                    if (data.content) resultText += data.content;
-                } catch {}
-            }
-        }
-    } else {
-        // 尝试纯 JSON 格式
-        try {
-            const data = JSON.parse(body);
-            if (data.result) resultText += data.result;
-            if (data.text) resultText += data.text;
-            if (data.content) resultText += data.content;
-        } catch {}
-
-        // Connect RPC 格式备用
-        let pos = 0;
-        while (pos < body.length) {
-            const braceIndex = body.indexOf('{', pos);
-            if (braceIndex === -1) break;
-            let depth = 0;
-            let start = braceIndex;
-            for (let i = braceIndex; i < body.length; i++) {
-                if (body[i] === '{') depth++;
-                else if (body[i] === '}') depth--;
-                if (depth === 0) {
-                    const jsonStr = body.substring(start, i + 1);
-                    pos = i + 1;
-                    try {
-                        const data = JSON.parse(jsonStr);
-                        if (data.heartbeat) continue;
-                        if (data.block && data.block.text && data.block.text.content) {
-                            resultText += data.block.text.content;
-                        }
-                    } catch {
-                        pos = braceIndex + 1;
-                    }
-                    break;
-                }
-            }
-        }
+    if (!body.includes('data:')) {
+        return { text: resultText, complete: isComplete, references };
     }
 
-    return { text: resultText, complete: isComplete };
+    const lines = body.split('\n');
+    let currentEvent = '';
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.startsWith('event:')) {
+            currentEvent = trimmed.substring(6).trim();
+            continue;
+        }
+
+        if (!trimmed.startsWith('data:')) continue;
+        const dataStr = trimmed.substring(5).trim();
+        if (!dataStr || dataStr === '[DONE]') {
+            if (dataStr === '[DONE]') isComplete = true;
+            continue;
+        }
+
+        try {
+            const data = JSON.parse(dataStr);
+
+            // chat.baidu.com 格式: data.data.message.content.generator
+            const message = data?.data?.message;
+            if (message) {
+                const content = message.content;
+                if (content) {
+                    // 提取 generator 数据
+                    const generator = content.generator;
+                    if (generator) {
+                        // 调试：记录组件类型
+                        if (generator.component) {
+                            logger.debug('适配器', `SSE 组件: ${generator.component}`, meta);
+                        }
+
+                        // 只处理 markdown-yiyan 组件 (AI 的文本回复)
+                        if (generator.component === 'markdown-yiyan') {
+                            // 提取文本: generator.data.value (增量 markdown)
+                            if (generator.data && typeof generator.data.value === 'string') {
+                                resultText += generator.data.value;
+                            }
+                        }
+
+                        // 从 thinkingSteps 组件提取搜索引用
+                        if (generator.component === 'thinkingSteps' && generator.data) {
+                            // referenceList 数组格式
+                            if (generator.data.referenceList && Array.isArray(generator.data.referenceList)) {
+                                for (const item of generator.data.referenceList) {
+                                    const url = item.url || item.link || '';
+                                    const title = item.title || item.name || '';
+                                    const site = item.site || item.source || '';
+                                    if (url && !references.some(r => r.url === url)) {
+                                        references.push({ url, title, site });
+                                    }
+                                }
+                            }
+                            // referenceListArr 数组格式
+                            if (generator.data.referenceListArr && Array.isArray(generator.data.referenceListArr)) {
+                                for (const item of generator.data.referenceListArr) {
+                                    if (typeof item === 'object') {
+                                        const url = item.url || item.link || '';
+                                        const title = item.title || item.name || '';
+                                        const site = item.site || item.source || '';
+                                        if (url && !references.some(r => r.url === url)) {
+                                            references.push({ url, title, site });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 检查完成标记
+                        if (generator.isFinished === true) {
+                            isComplete = true;
+                        }
+                    }
+                }
+
+                // 检查 metaData 中的状态
+                if (message.metaData) {
+                    if (message.metaData.state === 'complete-resp' || message.metaData.endTurn === true) {
+                        isComplete = true;
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    return { text: resultText, complete: isComplete, references };
 }
 
 /**
@@ -626,8 +418,8 @@ function parseResponse(body) {
  */
 export const manifest = {
     id: 'yiyan_text',
-    displayName: '文心一言 (ERNIE)',
-    description: '使用百度文心一言生成文本。需要已登录的百度账户。',
+    displayName: '百度AI聊天 (chat.baidu.com)',
+    description: '使用百度AI聊天(chat.baidu.com)生成文本。需要已登录的百度账户。',
 
     getTargetUrl(config, workerConfig) {
         return TARGET_URL;

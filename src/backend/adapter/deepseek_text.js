@@ -73,6 +73,40 @@ async function configureModel(page, modelConfig, meta = {}) {
 }
 
 /**
+ * 从 SEARCH fragment 中提取搜索引用
+ * @param {object} fragment - SEARCH fragment 对象
+ * @param {Array<{title: string, url: string}>} refs - 引用收集数组
+ * @param {object} meta - 日志元数据
+ */
+function collectSearchRefs(fragment, refs, meta) {
+    logger.debug('适配器', `SEARCH fragment: ${JSON.stringify(fragment).slice(0, 500)}`, meta);
+
+    // 尝试从 content 字符串中提取 URL
+    if (typeof fragment.content === 'string' && fragment.content) {
+        const urlRegex = /https?:\/\/[^\s"'<>\])，。、]+/g;
+        let match;
+        while ((match = urlRegex.exec(fragment.content)) !== null) {
+            const url = match[0].replace(/[,;.):！？）》]+$/, '');
+            if (url && !refs.some(r => r.url === url)) {
+                refs.push({ title: '', url });
+            }
+        }
+    }
+
+    // 尝试从结构化字段提取
+    const results = fragment.results || fragment.search_results || [];
+    if (Array.isArray(results)) {
+        for (const result of results) {
+            const title = result.title || '';
+            const url = result.url || result.link || '';
+            if (url && !refs.some(r => r.url === url)) {
+                refs.push({ title, url });
+            }
+        }
+    }
+}
+
+/**
  * 执行文本生成任务
  * @param {object} context - 浏览器上下文 { page, config }
  * @param {string} prompt - 提示词
@@ -127,6 +161,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         let isComplete = false;
         let isCollecting = false;  // 当前最后一个 fragment 是否为 RESPONSE 类型
         let isCollectingThinking = false;  // 是否正在收集 thinking
+        let searchReferences = [];  // 搜索引用收集
 
         const responsePromise = page.waitForResponse(async (response) => {
             const url = response.url();
@@ -162,6 +197,10 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                                     isCollectingThinking = true;
                                     isCollecting = false;
                                     if (fragment.content) thinkingContent += fragment.content;
+                                } else if (fragment.type === 'SEARCH') {
+                                    isCollecting = false;
+                                    isCollectingThinking = false;
+                                    collectSearchRefs(fragment, searchReferences, meta);
                                 } else {
                                     isCollecting = false;
                                     isCollectingThinking = false;
@@ -180,6 +219,10 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                                     isCollectingThinking = true;
                                     isCollecting = false;
                                     if (fragment.content) thinkingContent += fragment.content;
+                                } else if (fragment.type === 'SEARCH') {
+                                    isCollecting = false;
+                                    isCollectingThinking = false;
+                                    collectSearchRefs(fragment, searchReferences, meta);
                                 } else {
                                     isCollecting = false;
                                     isCollectingThinking = false;
@@ -200,6 +243,10 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                                             isCollectingThinking = true;
                                             isCollecting = false;
                                             if (fragment.content) thinkingContent += fragment.content;
+                                        } else if (fragment.type === 'SEARCH') {
+                                            isCollecting = false;
+                                            isCollectingThinking = false;
+                                            collectSearchRefs(fragment, searchReferences, meta);
                                         } else {
                                             isCollecting = false;
                                             isCollectingThinking = false;
@@ -214,6 +261,22 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                         }
 
                         // --- 处理文本内容追加 ---
+
+                        // 搜索结果 (response/fragments/N/results)
+                        if (data.p && Array.isArray(data.v)) {
+                            const resultsMatch = data.p.match(/response\/fragments\/(-?\d+)\/results/);
+                            if (resultsMatch) {
+                                for (const result of data.v) {
+                                    const url = result.url || '';
+                                    const title = result.title || '';
+                                    const siteName = result.site_name || '';
+                                    const citeIndex = result.cite_index;
+                                    if (url && !searchReferences.some(r => r.url === url)) {
+                                        searchReferences.push({ title, url, siteName, citeIndex });
+                                    }
+                                }
+                            }
+                        }
 
                         // 带路径的 content 操作 (如 response/fragments/-1/content)
                         if (data.p && typeof data.v === 'string') {
@@ -277,7 +340,21 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         logger.info('适配器', '文本生成完成，任务完成', meta);
 
         const trimmedThinking = thinkingContent.trim();
-        const result = { text: textContent.trim() };
+        let resultText = textContent.trim();
+
+        // 如果有搜索引用，追加到正文末尾
+        if (searchReferences.length > 0) {
+            searchReferences.sort((a, b) => (a.citeIndex ?? 0) - (b.citeIndex ?? 0));
+            const refsText = '\n\n---\n**参考资料：**\n' + searchReferences.map(ref => {
+                const citeLabel = ref.citeIndex != null ? `[${ref.citeIndex}] ` : '';
+                const siteLabel = ref.siteName ? ` - ${ref.siteName}` : '';
+                return `- ${citeLabel}${ref.title}${siteLabel}: ${ref.url}`;
+            }).join('\n');
+            resultText += refsText;
+            logger.info('适配器', `已提取 ${searchReferences.length} 条搜索引用`, meta);
+        }
+
+        const result = { text: resultText };
 
         // 返回结果（如果有 thinking 则包含 reasoning）
         if (trimmedThinking) {

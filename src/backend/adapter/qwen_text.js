@@ -170,6 +170,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         let resultText = '';
         let isComplete = false;
+        let collectedReferences = [];  // 收集搜索引用
 
         // 监听 WebSocket 消息 (通义千问可能使用 WebSocket)
         page.on('websocket', ws => {
@@ -207,7 +208,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             // 记录可能相关的 API 请求
             if (method === 'POST' && status === 200) {
                 if (url.includes('chat') || url.includes('completion') || url.includes('stream') ||
-                    url.includes('conversation') || url.includes('qwen') || url.includes('tongyi')) {
+                    url.includes('conversation') || url.includes('qwen') || url.includes('tongyi') ||
+                    url.includes('api') || url.includes('bot')) {
                     logger.info('适配器', `发现 API: ${method} ${url} (${contentType.substring(0, 50)})`, meta);
                 }
             }
@@ -217,12 +219,20 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 logger.info('适配器', `收到 SSE 响应: ${url}`, meta);
                 try {
                     const body = await response.text();
-                    const parsed = parseSSEResponse(body);
+                    const parsed = parseSSEResponse(body, meta);
                     if (parsed.text) {
                         resultText += parsed.text;
                     }
                     if (parsed.complete) {
                         isComplete = true;
+                    }
+                    if (parsed.references && parsed.references.length > 0) {
+                        for (const ref of parsed.references) {
+                            // 去重：使用 url 作为唯一标识
+                            if (ref.url && !collectedReferences.some(r => r.url === ref.url)) {
+                                collectedReferences.push(ref);
+                            }
+                        }
                     }
                 } catch (e) {
                     logger.warn('适配器', `SSE 解析错误: ${e.message}`, meta);
@@ -231,14 +241,22 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
             // JSON 响应处理
             if (contentType.includes('application/json') && method === 'POST' && status === 200) {
-                if (url.includes('chat') || url.includes('completion') || url.includes('conversation')) {
+                if (url.includes('chat') || url.includes('completion') || url.includes('conversation') ||
+                    url.includes('api') || url.includes('bot') || url.includes('message')) {
                     logger.info('适配器', `收到 JSON 响应: ${url}`, meta);
                     try {
                         const body = await response.text();
-                        const parsed = parseJsonResponse(body);
+                        const parsed = parseJsonResponse(body, meta);
                         if (parsed.text) {
                             resultText = parsed.text;
                             isComplete = true;
+                        }
+                        if (parsed.references && parsed.references.length > 0) {
+                            for (const ref of parsed.references) {
+                                if (!collectedReferences.some(r => r.url === ref.url)) {
+                                    collectedReferences.push(ref);
+                                }
+                            }
                         }
                     } catch (e) {
                         logger.warn('适配器', `JSON 解析错误: ${e.message}`, meta);
@@ -332,6 +350,123 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                         return null;
                     });
 
+                    // 提取搜索引用链接（通义千问的特殊处理）
+                    const searchReferences = await page.evaluate(() => {
+                        const refs = [];
+                        const debugInfo = [];  // 调试信息
+
+                        // 专门查找通义千问的引用链接区域
+                        // 通义千问的引用通常在聊天消息下方，带有"来源"标记
+
+                        // 0. 调试：记录所有外部链接和可能相关的元素
+                        const allLinks = document.querySelectorAll('a[href]');
+                        for (const link of allLinks) {
+                            const href = link.href || '';
+                            if (href.startsWith('http') && !href.includes('qianwen.com') && !href.includes('alicdn.com') && !href.includes('track.uc.cn')) {
+                                const text = link.textContent?.trim().slice(0, 50) || '';
+                                const className = link.className || '';
+                                const parentClass = link.parentElement?.className || '';
+                                debugInfo.push({ href, text, className, parentClass });
+                            }
+                        }
+
+                        // 调试：查找包含"来源"的所有元素的类名
+                        const sourceElements = document.querySelectorAll('*');
+                        for (const el of sourceElements) {
+                            const text = el.textContent || '';
+                            if (text.includes('篇来源') || text.match(/^\d+篇来源$/)) {
+                                debugInfo.push({
+                                    type: 'source_element',
+                                    tagName: el.tagName,
+                                    className: el.className,
+                                    text: text.slice(0, 100),
+                                    innerHTML: el.innerHTML?.slice(0, 200)
+                                });
+                                // 查找这个元素的父级和兄弟元素
+                                const parent = el.parentElement;
+                                if (parent) {
+                                    debugInfo.push({
+                                        type: 'parent_element',
+                                        tagName: parent.tagName,
+                                        className: parent.className,
+                                        innerHTML: parent.innerHTML?.slice(0, 300)
+                                    });
+                                }
+                            }
+                        }
+
+                        // 1. 查找所有带有 cite/reference 类的链接
+                        const citeElements = document.querySelectorAll('[class*="cite"], [class*="reference"], [class*="source"]');
+                        for (const el of citeElements) {
+                            const links = el.querySelectorAll('a[href]');
+                            for (const link of links) {
+                                const href = link.href || '';
+                                const text = link.textContent?.trim() || '';
+                                if (href && href.startsWith('http') && !href.includes('qianwen.com') && !href.includes('alicdn.com')) {
+                                    refs.push({ url: href, title: text.slice(0, 100) });
+                                }
+                            }
+                        }
+
+                        // 2. 查找"来源"或"N篇来源"区域下的链接
+                        const sourceContainers = document.querySelectorAll('div, section, span');
+                        for (const container of sourceContainers) {
+                            const text = container.textContent || '';
+                            if (text.includes('来源') || text.match(/\d+篇来源/)) {
+                                // 找到包含"来源"的容器，查找其中的链接
+                                const links = container.querySelectorAll('a[href]');
+                                for (const link of links) {
+                                    const href = link.href || '';
+                                    const text = link.textContent?.trim() || '';
+                                    if (href && href.startsWith('http') && !href.includes('qianwen.com') && !href.includes('alicdn.com')) {
+                                        refs.push({ url: href, title: text.slice(0, 100) });
+                                    }
+                                }
+                                // 也查找父级和兄弟元素
+                                const parent = container.parentElement;
+                                if (parent) {
+                                    const parentLinks = parent.querySelectorAll('a[href]');
+                                    for (const link of parentLinks) {
+                                        const href = link.href || '';
+                                        const text = link.textContent?.trim() || '';
+                                        if (href && href.startsWith('http') && !href.includes('qianwen.com') && !href.includes('alicdn.com') && !refs.some(r => r.url === href)) {
+                                            refs.push({ url: href, title: text.slice(0, 100) });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 3. 查找气泡/卡片类型的引用元素
+                        const bubbleRefs = document.querySelectorAll('[class*="bubble"], [class*="card"], [class*="link-card"]');
+                        for (const bubble of bubbleRefs) {
+                            const link = bubble.querySelector('a[href]');
+                            if (link) {
+                                const href = link.href || '';
+                                const text = link.textContent?.trim() || bubble.getAttribute('title') || '';
+                                if (href && href.startsWith('http') && !href.includes('qianwen.com') && !href.includes('alicdn.com')) {
+                                    refs.push({ url: href, title: text.slice(0, 100) });
+                                }
+                            }
+                        }
+
+                        return { refs, debugInfo };
+                    });
+
+                    if (searchReferences.debugInfo && searchReferences.debugInfo.length > 0) {
+                        // logger.info('适配器', `DOM 调试信息: ${JSON.stringify(searchReferences.debugInfo.slice(0, 10))}`, meta);
+                    }
+
+                    if (searchReferences.refs && searchReferences.refs.length > 0) {
+                        logger.info('适配器', `从 DOM 发现 ${searchReferences.refs.length} 条引用链接`, meta);
+                        // 将 DOM 获取的 URL 合并到已收集的引用中
+                        for (const ref of searchReferences.refs) {
+                            if (!collectedReferences.some(r => r.url === ref.url)) {
+                                collectedReferences.push(ref);
+                            }
+                        }
+                    }
+
                     if (pageReply && typeof pageReply === 'string' && pageReply.trim().length > 20) {
                         const currentLength = pageReply.trim().length;
 
@@ -397,9 +532,40 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         }
 
         logger.info('适配器', `已获取文本内容 (${resultText.length} 字符)`, meta);
+
+        // 拼接搜索引用到正文末尾
+        let finalText = resultText.trim();
+        if (collectedReferences.length > 0) {
+            // 去重：基于 url
+            const uniqueRefs = [];
+            for (const ref of collectedReferences) {
+                if (ref.url && !uniqueRefs.some(r => r.url === ref.url)) {
+                    uniqueRefs.push(ref);
+                }
+            }
+
+            if (uniqueRefs.length > 0) {
+                const refsText = '\n\n---\n**参考资料：**\n' + uniqueRefs.map((ref, i) => {
+                    const title = ref.title || ref.name || '';
+                    const url = ref.url || '';
+                    if (title && url) {
+                        return `- [${i + 1}] ${title}: ${url}`;
+                    } else if (url) {
+                        return `- [${i + 1}] ${url}`;
+                    } else {
+                        // 没有 URL 时，显示来源名称
+                        const sourceName = ref.title || ref.summary?.slice(0, 100) || '未知来源';
+                        return `- [${i + 1}] ${sourceName}`;
+                    }
+                }).join('\n');
+                finalText += refsText;
+                logger.info('适配器', `已提取 ${uniqueRefs.length} 条搜索引用（含 URL）`, meta);
+            }
+        }
+
         logger.info('适配器', '文本生成完成，任务完成', meta);
 
-        return { text: resultText.trim() };
+        return { text: finalText };
 
     } catch (err) {
         const pageError = normalizePageError(err, meta);
@@ -413,11 +579,13 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 /**
  * 解析 SSE 响应
  * @param {string} body - SSE 响应体
- * @returns {{text: string, complete: boolean}}
+ * @param {object} meta - 日志元数据
+ * @returns {{text: string, complete: boolean, references: Array}}
  */
-function parseSSEResponse(body) {
+function parseSSEResponse(body, meta = {}) {
     let resultText = '';
     let isComplete = false;
+    let references = [];  // 收集搜索引用
 
     const lines = body.split('\n');
     for (const line of lines) {
@@ -433,6 +601,54 @@ function parseSSEResponse(body) {
 
             try {
                 const data = JSON.parse(dataStr);
+
+                // 调试：记录引用相关的 SSE 数据结构
+                // logger.debug('适配器', `SSE 引用数据: ${JSON.stringify(data).slice(0, 500)}`, meta);
+
+                // 通义千问特有的格式: data.messages 数组
+                if (data.data && data.data.messages && Array.isArray(data.data.messages)) {
+                    for (const msg of data.data.messages) {
+                        // 提取文本内容 (mime_type: multi_load/iframe) - 注意：content 是累积的完整内容
+                        if (msg.mime_type === 'multi_load/iframe' && msg.content) {
+                            resultText = msg.content;  // 直接赋值，不要追加
+                        }
+
+                        // 提取搜索引用 (mime_type: bar/iframe 或 bar/progress) - 包含完整 URL
+                        if ((msg.mime_type === 'bar/iframe' || msg.mime_type === 'bar/progress') && msg.meta_data) {
+                            // bar/iframe 格式: meta_data.sources[].content.list[]
+                            if (msg.meta_data.sources && Array.isArray(msg.meta_data.sources)) {
+                                for (const source of msg.meta_data.sources) {
+                                    if (source.type === 'source' && source.content && source.content.list) {
+                                        for (const item of source.content.list) {
+                                            const url = item.url || item.raw_url || '';
+                                            const title = item.title || item.name || '';
+                                            const summary = item.summary || '';
+                                            if (url && !references.some(r => r.url === url)) {
+                                                references.push({ url, title, summary });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // bar/progress 格式: meta_data.list[]
+                            if (msg.meta_data.list && Array.isArray(msg.meta_data.list)) {
+                                for (const item of msg.meta_data.list) {
+                                    const url = item.url || item.raw_url || '';
+                                    const title = item.title || item.name || '';
+                                    const summary = item.summary || '';
+                                    if (url && !references.some(r => r.url === url)) {
+                                        references.push({ url, title, summary });
+                                    }
+                                }
+                            }
+                        }
+
+                        // 完成标记 (status: finished)
+                        if (msg.status === 'finished' || data.data.status === 'finished') {
+                            isComplete = true;
+                        }
+                    }
+                }
 
                 // 通义千问可能的格式
                 if (data.output && data.output.text) {
@@ -468,21 +684,98 @@ function parseSSEResponse(body) {
                     isComplete = true;
                 }
 
+                // 提取搜索引用 - 通义千问可能的格式
+                // 格式1: search_results / searchReferences / references 字段
+                if (data.search_results && Array.isArray(data.search_results)) {
+                    for (const ref of data.search_results) {
+                        const url = ref.url || ref.link || '';
+                        const title = ref.title || ref.name || '';
+                        if (url && !references.some(r => r.url === url)) {
+                            references.push({ title, url });
+                        }
+                    }
+                }
+
+                if (data.references && Array.isArray(data.references)) {
+                    for (const ref of data.references) {
+                        const url = ref.url || ref.link || '';
+                        const title = ref.title || ref.name || '';
+                        if (url && !references.some(r => r.url === url)) {
+                            references.push({ title, url });
+                        }
+                    }
+                }
+
+                // 格式2: output 中包含引用
+                if (data.output) {
+                    if (data.output.search_results && Array.isArray(data.output.search_results)) {
+                        for (const ref of data.output.search_results) {
+                            const url = ref.url || ref.link || '';
+                            const title = ref.title || ref.name || '';
+                            if (url && !references.some(r => r.url === url)) {
+                                references.push({ title, url });
+                            }
+                        }
+                    }
+                    if (data.output.references && Array.isArray(data.output.references)) {
+                        for (const ref of data.output.references) {
+                            const url = ref.url || ref.link || '';
+                            const title = ref.title || ref.name || '';
+                            if (url && !references.some(r => r.url === url)) {
+                                references.push({ title, url });
+                            }
+                        }
+                    }
+                }
+
+                // 格式3: data 中包含 web_search 或 source 相关字段
+                if (data.web_search && data.web_search.results) {
+                    for (const ref of data.web_search.results) {
+                        const url = ref.url || ref.link || '';
+                        const title = ref.title || ref.name || '';
+                        if (url && !references.some(r => r.url === url)) {
+                            references.push({ title, url });
+                        }
+                    }
+                }
+
+                // 格式4: sources 字段
+                if (data.sources && Array.isArray(data.sources)) {
+                    for (const ref of data.sources) {
+                        const url = ref.url || ref.link || '';
+                        const title = ref.title || ref.name || '';
+                        if (url && !references.some(r => r.url === url)) {
+                            references.push({ title, url });
+                        }
+                    }
+                }
+
+                // 调试：记录未知的数据结构
+                if (Object.keys(data).length > 0 && !data.output && !data.text && !data.content && !data.delta && !data.choices && !data.search_results && !data.references && !data.web_search && !data.sources) {
+                    logger.debug('适配器', `SSE 未知结构: ${JSON.stringify(data).slice(0, 200)}`, meta);
+                }
+
             } catch {}
         }
     }
 
-    return { text: resultText, complete: isComplete };
+    if (references.length > 0) {
+        logger.info('适配器', `SSE 解析发现 ${references.length} 条引用`, meta);
+    }
+
+    return { text: resultText, complete: isComplete, references };
 }
 
 /**
  * 解析 JSON 响应
  * @param {string} body - JSON 响应体
- * @returns {{text: string, complete: boolean}}
+ * @param {object} meta - 日志元数据
+ * @returns {{text: string, complete: boolean, references: Array}}
  */
-function parseJsonResponse(body) {
+function parseJsonResponse(body, meta = {}) {
     let resultText = '';
     let isComplete = false;
+    let references = [];  // 收集搜索引用
 
     try {
         const data = JSON.parse(body);
@@ -491,6 +784,21 @@ function parseJsonResponse(body) {
         if (data.output && data.output.text) {
             resultText = data.output.text;
             isComplete = true;
+            // 提取 output 中的引用
+            if (data.output.search_results && Array.isArray(data.output.search_results)) {
+                for (const ref of data.output.search_results) {
+                    const url = ref.url || ref.link || '';
+                    const title = ref.title || ref.name || '';
+                    if (url) references.push({ title, url });
+                }
+            }
+            if (data.output.references && Array.isArray(data.output.references)) {
+                for (const ref of data.output.references) {
+                    const url = ref.url || ref.link || '';
+                    const title = ref.title || ref.name || '';
+                    if (url) references.push({ title, url });
+                }
+            }
         }
         if (data.result) {
             resultText = data.result;
@@ -509,9 +817,46 @@ function parseJsonResponse(body) {
             isComplete = true;
         }
 
+        // 提取顶层的搜索引用
+        if (data.search_results && Array.isArray(data.search_results)) {
+            for (const ref of data.search_results) {
+                const url = ref.url || ref.link || '';
+                const title = ref.title || ref.name || '';
+                if (url) references.push({ title, url });
+            }
+        }
+        if (data.references && Array.isArray(data.references)) {
+            for (const ref of data.references) {
+                const url = ref.url || ref.link || '';
+                const title = ref.title || ref.name || '';
+                if (url) references.push({ title, url });
+            }
+        }
+        if (data.web_search && data.web_search.results && Array.isArray(data.web_search.results)) {
+            for (const ref of data.web_search.results) {
+                const url = ref.url || ref.link || '';
+                const title = ref.title || ref.name || '';
+                if (url) references.push({ title, url });
+            }
+        }
+        if (data.sources && Array.isArray(data.sources)) {
+            for (const ref of data.sources) {
+                const url = ref.url || ref.link || '';
+                const title = ref.title || ref.name || '';
+                if (url) references.push({ title, url });
+            }
+        }
+
+        // 调试：记录完整响应结构（可能包含引用）
+        logger.debug('适配器', `JSON 响应结构: ${JSON.stringify(data).slice(0, 500)}`, meta);
+
     } catch {}
 
-    return { text: resultText, complete: isComplete };
+    if (references.length > 0) {
+        logger.info('适配器', `JSON 解析发现 ${references.length} 条引用`, meta);
+    }
+
+    return { text: resultText, complete: isComplete, references };
 }
 
 /**

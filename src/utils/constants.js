@@ -12,11 +12,11 @@
  * @readonly
  */
 export const TIMEOUTS = {
-    /** 元素点击超时 (safeClick) */
-    ELEMENT_CLICK: 25000,
+    /** 元素点击超时 (safeClick) - 增加到40秒以应对慢速网站 */
+    ELEMENT_CLICK: 40000,
 
     /** 输入框等待超时 (waitForInput) */
-    INPUT_WAIT: 20000,
+    INPUT_WAIT: 30000,
 
     /** 导航超时（页面跳转 gotoWithCheck） */
     NAVIGATION: 20000,
